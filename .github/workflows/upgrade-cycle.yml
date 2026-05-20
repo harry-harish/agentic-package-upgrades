@@ -1,0 +1,111 @@
+name: Agentic Package Upgrade Cycle
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  parse-metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      has_upgrade: ${{ steps.parse.outputs.has_upgrade }}
+      package: ${{ steps.parse.outputs.package }}
+      from_version: ${{ steps.parse.outputs.from_version }}
+      to_version: ${{ steps.parse.outputs.to_version }}
+      doc_path: ${{ steps.parse.outputs.doc_path }}
+    steps:
+      - name: Parse upgrade metadata from PR description
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const tableRegex = /\|\s*([^|\n]+)\s*\|\s*([^|\n]+)\s*\|\s*([^|\n]+)\s*\|\s*([^|\n]+)\s*\|/g;
+            let match;
+            let rows = [];
+            while ((match = tableRegex.exec(body)) !== null) {
+              rows.push(match.slice(1, 5).map(s => s.trim()));
+            }
+            const dataRows = rows.filter(r =>
+              !r[0].toLowerCase().includes('package') &&
+              !r[0].includes('---') &&
+              !r[0].includes('Package')
+            );
+            if (dataRows.length === 0) {
+              core.setOutput('has_upgrade', 'false');
+              return;
+            }
+            const [pkg, from, to, docPath] = dataRows[0];
+            core.setOutput('has_upgrade', 'true');
+            core.setOutput('package', pkg);
+            core.setOutput('from_version', from);
+            core.setOutput('to_version', to);
+            core.setOutput('doc_path', docPath);
+
+  upgrade:
+    needs: parse-metadata
+    if: needs.parse-metadata.outputs.has_upgrade == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Run agentic upgrade cycle
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            You are an autonomous package upgrade agent. Your task is to migrate this repository
+            from ${{ needs.parse-metadata.outputs.package }} ${{ needs.parse-metadata.outputs.from_version }}
+            to ${{ needs.parse-metadata.outputs.to_version }}.
+
+            Breaking-change doc: ${{ needs.parse-metadata.outputs.doc_path }}
+
+            Follow these steps in order. Do not skip any step.
+
+            **A. Read context**
+            - Read CLAUDE.md if it exists
+            - Read repo-context.md if it exists
+            - Read the breaking-change doc at ${{ needs.parse-metadata.outputs.doc_path }}
+
+            **B. Baseline tests**
+            - Run the test suite (npm test, yarn test, or equivalent — detect which)
+            - Record every pre-existing FAIL — these are excluded from regression detection later
+            - Save baseline results to /tmp/baseline-test-results.txt
+
+            **C. Impact analysis**
+            - Use ripgrep (rg) to search the entire codebase for every pattern listed in the breaking-change doc
+            - Classify each finding:
+              - BREAKING — directly uses the changed API, will fail without migration
+              - INDIRECT — depends on something that uses the changed API
+              - SAFE — no dependency on the changed API
+            - Compile a complete impact list
+
+            **D. Write tests**
+            - For every BREAKING usage, write or update tests that cover the current behavior BEFORE making any changes
+            - Tests must pass against the current (old) version
+            - Commit: "test: add coverage for ${{ needs.parse-metadata.outputs.package }} BREAKING usages before migration"
+
+            **E. Apply migration**
+            - Apply the smallest possible changes to migrate each BREAKING usage
+            - One commit per breaking change: "migrate: [description of change]"
+            - No refactoring, no cleanup — migration only
+
+            **F. Validate**
+            - Run the full test suite again
+            - Compare against the baseline from step B
+            - Flag only NEW failures — pre-existing failures are not regressions
+
+            **G. Post migration report**
+            Post a PR comment with a structured migration report:
+            - Summary table: every BREAKING usage, what changed, which commit
+            - Test results: before vs after
+            - Any items needing human review (flag clearly)
+
+            Format the report as a markdown checklist so each item can be verified independently.

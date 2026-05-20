@@ -1,0 +1,164 @@
+name: Agentic Review Responder
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  check-reviewer:
+    runs-on: ubuntu-latest
+    outputs:
+      is_coderabbit: ${{ steps.check.outputs.is_coderabbit }}
+      max_rounds_reached: ${{ steps.check.outputs.max_rounds_reached }}
+    steps:
+      - name: Check reviewer and track round count
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reviewer = context.payload.review.user.login;
+            const isCodeRabbit = reviewer === 'coderabbitai[bot]' || reviewer.includes('coderabbit');
+            core.setOutput('is_coderabbit', isCodeRabbit.toString());
+
+            if (!isCodeRabbit) return;
+
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const roundLabels = labels.filter(l => l.startsWith('upgrade-cycle-round-'));
+            const currentRound = roundLabels.length;
+            const nextRound = currentRound + 1;
+
+            core.setOutput('max_rounds_reached', (currentRound >= 3).toString());
+
+            if (currentRound < 3) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: [`upgrade-cycle-round-${nextRound}`]
+              });
+            }
+
+  respond:
+    needs: check-reviewer
+    if: needs.check-reviewer.outputs.is_coderabbit == 'true' && needs.check-reviewer.outputs.max_rounds_reached == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Fetch all CodeRabbit review comments (paginated)
+        id: fetch-comments
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            let allComments = [];
+            let page = 1;
+
+            while (true) {
+              const { data } = await github.rest.pulls.listReviewComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100,
+                page
+              });
+
+              if (data.length === 0) break;
+
+              const codeRabbitComments = data.filter(c =>
+                c.user.login === 'coderabbitai[bot]' || c.user.login.includes('coderabbit')
+              );
+              allComments = allComments.concat(codeRabbitComments);
+              if (data.length < 100) break;
+              page++;
+            }
+
+            return JSON.stringify(allComments.map(c => ({
+              id: c.id,
+              path: c.path,
+              line: c.line,
+              body: c.body,
+              in_reply_to_id: c.in_reply_to_id || null
+            })));
+
+      - name: Respond to CodeRabbit comments
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            You are a code review responder. CodeRabbit has reviewed a pull request and left
+            inline comments. Evaluate each comment and take the appropriate action.
+
+            ## CodeRabbit inline comments (JSON)
+            ${{ steps.fetch-comments.outputs.result }}
+
+            ## Repository
+            ${{ github.repository }}
+
+            ## PR number
+            ${{ github.event.pull_request.number }}
+
+            ---
+
+            ## Classification rules
+
+            Classify each comment as one of:
+            - **BLOCKING** — a real bug, incorrect logic, security issue, or violation of a stated requirement
+            - **SUGGESTION** — a valid improvement that makes the code cleaner, safer, or more correct
+            - **NITPICK** — style preference, minor naming, or cosmetic feedback
+            - **FALSE_POSITIVE** — CodeRabbit misunderstood the code or flagged something that isn't a problem
+
+            ## Actions per classification
+
+            **BLOCKING or SUGGESTION:**
+            1. Make the code change
+            2. Commit: "fix(review): [brief description] — addresses CodeRabbit comment #[id]"
+            3. Post an inline reply using:
+               POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/replies
+               Body: "Fixed in [commit SHA]. [one sentence on what changed]"
+
+            **NITPICK or FALSE_POSITIVE:**
+            1. Do NOT change any code
+            2. Post an inline reply using:
+               POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/replies
+               Body: "[NITPICK/FALSE_POSITIVE] [clear explanation of why this was not addressed]"
+
+            ## CRITICAL: always use inline replies
+            Use `pulls/comments/{id}/replies` (NOT `issues/{pr}/comments`) for individual
+            comment responses. Use the comment ID from the JSON above to thread the reply
+            to the correct comment.
+
+            ## After processing all comments
+
+            Post a summary comment on the PR:
+            POST /repos/{owner}/{repo}/issues/{pr_number}/comments
+
+            Include:
+            - Number of BLOCKING/SUGGESTION items fixed (with commit SHAs)
+            - Number of NITPICK/FALSE_POSITIVE items explained
+            - Any items that require human judgement (flag clearly)
+
+  max-rounds-warning:
+    needs: check-reviewer
+    if: needs.check-reviewer.outputs.is_coderabbit == 'true' && needs.check-reviewer.outputs.max_rounds_reached == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: '⚠️ **Maximum review cycles reached (3/3).** The automated Claude ↔ CodeRabbit loop has completed its maximum rounds. Human review is required to resolve any remaining comments.'
+            });
