@@ -4,7 +4,7 @@ A GitHub Actions pipeline that autonomously handles non-backward-compatible pack
 
 **Claude** does the upgrade and responds to code review. **CodeRabbit** does the automated review. **GitHub Actions** orchestrates everything. A human provides domain context at the start and makes the final merge call.
 
-→ Full writeup: [We Automated the Package Upgrade Nobody Wanted to Do](https://personal-swart-pi.vercel.app/writing/agentic-package-upgrades-claude-coderabbit-github-actions)
+→ Full writeup: [We Automated the Package Upgrade Nobody Wanted to Do](https://harishkumar.dev/writing/agentic-package-upgrades-claude-coderabbit-github-actions)
 
 ---
 
